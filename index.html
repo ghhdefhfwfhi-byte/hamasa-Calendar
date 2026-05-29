@@ -213,6 +213,8 @@ body::before {
   </div>
   <div class="nav-spacer"></div>
   <button class="btn" onclick="applyTemplate()">✨ تعبئة بالإيقاع الأسبوعي</button>
+  <button class="btn" onclick="exportData()" title="تصدير نسخة احتياطية">📤 تصدير</button>
+  <label class="btn" style="cursor:pointer" title="استيراد نسخة احتياطية">📥 استيراد<input type="file" accept=".json" onchange="importData(event)" style="display:none"></label>
   <button class="btn btn-primary" onclick="saveLocal()">💾 حفظ</button>
 </nav>
 
@@ -404,13 +406,76 @@ let current = new Date(2026, 5, 1); // يونيو 2026
 let posts = {}; // { 'YYYY-M-D': [ {title,cat,plat,note} ] }
 let selectedKey = null;
 
-// ─── LOAD / SAVE (in-memory only; localStorage غير مدعوم هنا) ──────
+// ─── STORAGE KEY ──────────────────────────────────────────
+const LS_POSTS = 'hamasa_posts_v1';
+const LS_IDEAS = 'hamasa_ideas_v1';
+
+// ─── LOAD FROM localStorage ON STARTUP ───────────────────
+(function loadSaved() {
+  try {
+    const savedPosts = localStorage.getItem(LS_POSTS);
+    const savedIdeas = localStorage.getItem(LS_IDEAS);
+    if (savedPosts) Object.assign(posts, JSON.parse(savedPosts));
+    if (savedIdeas) { ideaBank.length = 0; ideaBank.push(...JSON.parse(savedIdeas)); }
+  } catch(e) { console.warn('تعذّر تحميل البيانات المحفوظة', e); }
+})();
+
+// ─── SAVE TO localStorage ─────────────────────────────────
 function saveLocal() {
-  // في الاستضافة الحقيقية يمكن ربط Firebase أو localStorage
-  const s = document.querySelector('.btn-primary');
-  const orig = s.textContent;
-  s.textContent = '✓ تم الحفظ';
-  setTimeout(()=> s.textContent = orig, 1500);
+  try {
+    localStorage.setItem(LS_POSTS, JSON.stringify(posts));
+    localStorage.setItem(LS_IDEAS, JSON.stringify(ideaBank));
+    const s = document.querySelector('.btn-primary');
+    const orig = s.textContent;
+    s.textContent = '✅ تم الحفظ!';
+    s.style.background = '#2d7a4a';
+    setTimeout(()=>{ s.textContent = orig; s.style.background = ''; }, 1800);
+  } catch(e) {
+    alert('⚠️ تعذّر الحفظ: ' + e.message);
+  }
+}
+
+// ─── AUTO-SAVE (كل تغيير) ─────────────────────────────────
+function autoSave() {
+  try {
+    localStorage.setItem(LS_POSTS, JSON.stringify(posts));
+    localStorage.setItem(LS_IDEAS, JSON.stringify(ideaBank));
+  } catch(e) {}
+}
+
+// ─── EXPORT JSON BACKUP ───────────────────────────────────
+function exportData() {
+  const data = { posts, ideaBank, exportedAt: new Date().toISOString(), version: 1 };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'hamasa-calendar-backup-' + new Date().toISOString().slice(0,10) + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── IMPORT JSON BACKUP ───────────────────────────────────
+function importData(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.posts) throw new Error('ملف غير صالح');
+      if (!confirm('راح يُستبدل المحتوى الحالي بالنسخة المستوردة. متأكد؟')) return;
+      Object.keys(posts).forEach(k => delete posts[k]);
+      Object.assign(posts, data.posts);
+      if (data.ideaBank) { ideaBank.length = 0; ideaBank.push(...data.ideaBank); }
+      autoSave();
+      renderCalendar();
+      renderIdeas();
+      alert('✅ تم الاستيراد بنجاح!');
+    } catch(err) { alert('⚠️ خطأ في الاستيراد: ' + err.message); }
+  };
+  reader.readAsText(file);
+  event.target.value = '';
 }
 
 // ─── RENDER CALENDAR ─────────────────────────────────────
@@ -518,6 +583,7 @@ function addPost() {
   };
   if (!posts[selectedKey]) posts[selectedKey]=[];
   posts[selectedKey].push(p);
+  autoSave();
   document.getElementById('f-title').value='';
   document.getElementById('f-note').value='';
   document.getElementById('f-link').value='';
@@ -528,6 +594,7 @@ function addPost() {
 function delPost(i) {
   posts[selectedKey].splice(i,1);
   if (!posts[selectedKey].length) delete posts[selectedKey];
+  autoSave();
   renderExisting();
   renderCalendar();
 }
@@ -557,6 +624,7 @@ function applyTemplate() {
     if (!posts[k].some(p=>p.title===t.title))
       posts[k].push({ title:t.title, cat:t.cat, plat:t.plat, note:'' });
   }
+  autoSave();
   renderCalendar();
 }
 
@@ -647,18 +715,20 @@ function saveIdea() {
   };
   if (editingIdea===null || editingIdea===undefined) ideaBank.push(obj);
   else ideaBank[editingIdea] = obj;
+  autoSave();
   closeIdeaEditor();
   renderIdeas();
 }
 function deleteIdeaFromEditor() {
   if (editingIdea!==null && editingIdea!==undefined) {
     ideaBank.splice(editingIdea,1);
+    autoSave();
     closeIdeaEditor();
     renderIdeas();
   }
 }
 function deleteIdea(i) {
-  if (confirm('حذف هذه الفكرة من البنك؟')) { ideaBank.splice(i,1); renderIdeas(); }
+  if (confirm('حذف هذه الفكرة من البنك؟')) { ideaBank.splice(i,1); autoSave(); renderIdeas(); }
 }
 function closeIdeaEditor() { document.getElementById('ideaEditor').classList.remove('open'); }
 
@@ -670,6 +740,7 @@ openDay = function(y,m,d) {
     const k = keyOf(y,m,d);
     if (!posts[k]) posts[k]=[];
     posts[k].push({ title:pendingIdea.title, cat:pendingIdea.cat, plat:pendingIdea.meta.split('·')[0].trim(), note:pendingIdea.desc, link:pendingIdea.link||'' });
+    autoSave();
     cancelIdea();
     renderCalendar();
     return;
