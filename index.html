@@ -210,12 +210,13 @@ body::before {
   <div class="nav-logo">
     <span class="nav-logo-badge">حمَّاصة</span>
     <span class="nav-title">Content Calendar — كاليندر المحتوى</span>
+    <span id="fbStatus" style="font-size:11px;color:var(--caramel);background:rgba(200,150,90,0.1);padding:3px 10px;border-radius:20px;border:1px solid rgba(200,150,90,0.25);font-weight:700">🔄 جاري الاتصال...</span>
   </div>
   <div class="nav-spacer"></div>
   <button class="btn" onclick="applyTemplate()">✨ تعبئة بالإيقاع الأسبوعي</button>
   <button class="btn" onclick="exportData()" title="تصدير نسخة احتياطية">📤 تصدير</button>
   <label class="btn" style="cursor:pointer" title="استيراد نسخة احتياطية">📥 استيراد<input type="file" accept=".json" onchange="importData(event)" style="display:none"></label>
-  <button class="btn btn-primary" onclick="saveLocal()">💾 حفظ</button>
+  <button class="btn btn-primary" id="saveBtn" onclick="saveLocal()">💾 حفظ</button>
 </nav>
 
 <div class="wrap">
@@ -405,47 +406,121 @@ let ideaBank = [
 let current = new Date(2026, 5, 1); // يونيو 2026
 let posts = {}; // { 'YYYY-M-D': [ {title,cat,plat,note} ] }
 let selectedKey = null;
+let _fbReady = false; // Firebase loaded?
+let _saveTimer = null; // debounce timer
 
-// ─── STORAGE KEY ──────────────────────────────────────────
-const LS_POSTS = 'hamasa_posts_v1';
-const LS_IDEAS = 'hamasa_ideas_v1';
+// ─── FIREBASE CONFIG ──────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyBf_EuOu9zM_Iqf0iTn97MIY0P-hzXex-c",
+  authDomain: "hamasa-calendar.firebaseapp.com",
+  databaseURL: "https://hamasa-calendar-default-rtdb.firebaseio.com",
+  projectId: "hamasa-calendar",
+  storageBucket: "hamasa-calendar.firebasestorage.app",
+  messagingSenderId: "171934035302",
+  appId: "1:171934035302:web:646d241febe5d918b8aca7",
+  measurementId: "G-B1QF5CL7L9"
+};
 
-// ─── LOAD FROM localStorage ON STARTUP ───────────────────
-(function loadSaved() {
-  try {
-    const savedPosts = localStorage.getItem(LS_POSTS);
-    const savedIdeas = localStorage.getItem(LS_IDEAS);
-    if (savedPosts) Object.assign(posts, JSON.parse(savedPosts));
-    if (savedIdeas) { ideaBank.length = 0; ideaBank.push(...JSON.parse(savedIdeas)); }
-  } catch(e) { console.warn('تعذّر تحميل البيانات المحفوظة', e); }
-})();
-
-// ─── SAVE TO localStorage ─────────────────────────────────
-function saveLocal() {
-  try {
-    localStorage.setItem(LS_POSTS, JSON.stringify(posts));
-    localStorage.setItem(LS_IDEAS, JSON.stringify(ideaBank));
-    const s = document.querySelector('.btn-primary');
-    const orig = s.textContent;
-    s.textContent = '✅ تم الحفظ!';
-    s.style.background = '#2d7a4a';
-    setTimeout(()=>{ s.textContent = orig; s.style.background = ''; }, 1800);
-  } catch(e) {
-    alert('⚠️ تعذّر الحفظ: ' + e.message);
-  }
+// ─── STATUS INDICATOR ─────────────────────────────────────
+function setSyncStatus(state) {
+  // state: 'syncing' | 'saved' | 'offline' | 'error'
+  const btn = document.getElementById('saveBtn');
+  const badge = document.getElementById('fbStatus');
+  const map = {
+    syncing: { text: '🔄 جاري الحفظ...', bg: '#7a5a1a', badge: '🔄 جاري المزامنة', badgeColor: '#c8965a' },
+    saved:   { text: '✅ محفوظ',          bg: '#2d7a4a', badge: '🟢 متزامن',        badgeColor: '#4a9a5a' },
+    offline: { text: '⚠️ بدون إنترنت',   bg: '#7a4a1a', badge: '🔴 غير متصل',      badgeColor: '#c85a5a' },
+    error:   { text: '❌ خطأ بالحفظ',    bg: '#7a1a1a', badge: '⚠️ خطأ',           badgeColor: '#c85a5a' },
+    idle:    { text: '💾 حفظ',            bg: '',        badge: '🟢 متزامن',        badgeColor: '#4a9a5a' },
+  };
+  const s = map[state] || map.idle;
+  if (btn) { btn.textContent = s.text; btn.style.background = s.bg; }
+  if (badge) { badge.textContent = s.badge; badge.style.color = s.badgeColor; }
+  if (state === 'saved') setTimeout(() => setSyncStatus('idle'), 2500);
 }
 
-// ─── AUTO-SAVE (كل تغيير) ─────────────────────────────────
+// ─── FIREBASE INIT ────────────────────────────────────────
+let fbDatabase = null;
+let fbRef = null;
+
+function initFirebase() {
+  return new Promise((resolve) => {
+    // تحميل Firebase SDK ديناميكياً
+    const loadScript = (src) => new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = src; s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+
+    Promise.all([
+      loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js'),
+      loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js')
+    ]).then(() => {
+      firebase.initializeApp(firebaseConfig);
+      fbDatabase = firebase.database();
+      fbRef = fbDatabase.ref('hamasa');
+
+      // ─── Real-time listener: أي تغيير بالداتابيز يُحدّث الواجهة فوراً ───
+      fbRef.on('value', (snapshot) => {
+        const data = snapshot.val() || {};
+        // تحديث posts
+        const newPosts = data.posts || {};
+        Object.keys(posts).forEach(k => delete posts[k]);
+        Object.assign(posts, newPosts);
+        // تحديث ideaBank
+        if (data.ideaBank && Array.isArray(data.ideaBank)) {
+          ideaBank.length = 0;
+          ideaBank.push(...data.ideaBank);
+        }
+        _fbReady = true;
+        renderCalendar();
+        renderIdeas();
+        setSyncStatus('saved');
+      }, (err) => {
+        console.error('Firebase read error:', err);
+        setSyncStatus('offline');
+        _fbReady = true;
+        renderCalendar();
+        renderIdeas();
+      });
+
+      resolve();
+    }).catch((err) => {
+      console.error('Firebase load failed:', err);
+      setSyncStatus('offline');
+      _fbReady = true;
+      renderCalendar();
+      renderIdeas();
+      resolve();
+    });
+  });
+}
+
+// ─── WRITE TO FIREBASE (debounced 600ms) ─────────────────
 function autoSave() {
-  try {
-    localStorage.setItem(LS_POSTS, JSON.stringify(posts));
-    localStorage.setItem(LS_IDEAS, JSON.stringify(ideaBank));
-  } catch(e) {}
+  if (!fbRef) return; // Firebase لم يُحمّل بعد
+  if (_saveTimer) clearTimeout(_saveTimer);
+  setSyncStatus('syncing');
+  _saveTimer = setTimeout(() => {
+    fbRef.set({ posts, ideaBank, updatedAt: Date.now() })
+      .then(() => setSyncStatus('saved'))
+      .catch(() => setSyncStatus('error'));
+  }, 600);
+}
+
+// ─── زر الحفظ اليدوي (نفس autoSave لكن فوري) ─────────────
+function saveLocal() {
+  if (!fbRef) { setSyncStatus('offline'); return; }
+  if (_saveTimer) clearTimeout(_saveTimer);
+  setSyncStatus('syncing');
+  fbRef.set({ posts, ideaBank, updatedAt: Date.now() })
+    .then(() => setSyncStatus('saved'))
+    .catch(() => setSyncStatus('error'));
 }
 
 // ─── EXPORT JSON BACKUP ───────────────────────────────────
 function exportData() {
-  const data = { posts, ideaBank, exportedAt: new Date().toISOString(), version: 1 };
+  const data = { posts, ideaBank, exportedAt: new Date().toISOString(), version: 2 };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -471,7 +546,6 @@ function importData(event) {
       autoSave();
       renderCalendar();
       renderIdeas();
-      alert('✅ تم الاستيراد بنجاح!');
     } catch(err) { alert('⚠️ خطأ في الاستيراد: ' + err.message); }
   };
   reader.readAsText(file);
@@ -751,9 +825,9 @@ openDay = function(y,m,d) {
 // إغلاق مودال الأفكار بالضغط الخارجي
 document.getElementById('ideaEditor').addEventListener('click', e=>{ if(e.target.id==='ideaEditor') closeIdeaEditor(); });
 
-// ─── INIT ────────────────────────────────────────────────
-renderCalendar();
-renderIdeas();
+// ─── INIT — Firebase أولاً ────────────────────────────────
+setSyncStatus('syncing');
+initFirebase();
 </script>
 </body>
 </html>
